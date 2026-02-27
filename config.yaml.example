@@ -1,0 +1,101 @@
+general:
+  output_dir: "data/output"
+  db_path: "data/news.db"
+  timezone: "Asia/Shanghai"
+
+processing:
+  merge_window_days: 7
+
+llm:
+  # 支持所有 OpenAI 兼容 API (OpenAI, DeepSeek, Moonshot, 通义千问, Claude proxy 等)
+  # api_key 和 base_url 也可通过 LLM_API_KEY / LLM_BASE_URL 环境变量设置
+  api_key: ""                               # 留空则从 LLM_API_KEY 环境变量读取
+  base_url: ""                              # 留空则从 LLM_BASE_URL 环境变量读取，或使用 OpenAI 默认
+  model: "gpt-4o"
+  batch_size: 8
+  temperature: 0.3
+
+categories:
+  model:
+    name: "模型发布"
+    description: "新模型/版本更新/架构突破"
+  product:
+    name: "产品动态"
+    description: "新产品/功能/企业动态"
+  research:
+    name: "研究论文"
+    description: "学术研究/技术突破/论文"
+  tools:
+    name: "工具框架"
+    description: "开发工具/开源项目/SDK"
+  funding:
+    name: "融资并购"
+    description: "投资/收购/IPO"
+  events:
+    name: "行业事件"
+    description: "奖项/争议/政策/监管"
+
+rss_sources:
+  - name: "techcrunch_ai"
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+    enabled: true
+    keywords: []
+
+  - name: "the_verge_ai"
+    url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+    enabled: true
+    keywords: []
+
+  - name: "mit_tech_review"
+    url: "https://www.technologyreview.com/topic/artificial-intelligence/feed"
+    enabled: true
+    keywords: []
+
+  - name: "ars_technica"
+    url: "https://feeds.arstechnica.com/arstechnica/technology-lab"
+    enabled: true
+    keywords:
+      - "AI"
+      - "artificial intelligence"
+      - "machine learning"
+      - "LLM"
+      - "GPT"
+      - "neural"
+      - "deep learning"
+
+  - name: "openai_blog"
+    url: "https://openai.com/blog/rss.xml"
+    enabled: true
+    keywords: []
+
+  - name: "anthropic_news"
+    url: "https://www.anthropic.com/news/rss.xml"
+    enabled: false  # Anthropic 暂无公开 RSS feed
+    keywords: []
+
+  - name: "huggingface_blog"
+    url: "https://huggingface.co/blog/feed.xml"
+    enabled: true
+    keywords: []
+
+hackernews:
+  enabled: true
+  min_points: 50
+  max_items: 20
+  search_keywords:
+    - "AI"
+    - "LLM"
+    - "GPT"
+    - "Claude"
+    - "machine learning"
+    - "deep learning"
+    - "transformer"
+    - "neural network"
+    - "OpenAI"
+    - "Anthropic"
+
+http:
+  timeout: 30
+  delay: 1.0
+  max_retries: 3
+  user_agent: "ainewssprite/1.0"
