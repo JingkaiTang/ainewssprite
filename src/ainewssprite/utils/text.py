@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+import unicodedata
 
 
 def compute_content_hash(title: str, url: str) -> str:
@@ -26,3 +27,24 @@ def truncate(text: str, max_length: int = 500) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 3] + "..."
+
+
+def is_chinese(text: str, threshold: float = 0.3) -> bool:
+    """判断文本是否以中文为主。
+
+    当 CJK 统一表意文字占非空白字符比例超过 threshold 时返回 True。
+    """
+    if not text:
+        return False
+    cjk_count = 0
+    total = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        total += 1
+        if unicodedata.category(ch).startswith("Lo"):
+            # Lo = Letter, other (包含 CJK)
+            cjk_count += 1
+    if total == 0:
+        return False
+    return cjk_count / total >= threshold

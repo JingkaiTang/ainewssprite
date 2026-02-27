@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sources", nargs="+", help="仅运行指定的源 (e.g. hackernews techcrunch_ai)")
     parser.add_argument("--export", choices=["json", "md", "both"], help="从 DB 导出数据")
     parser.add_argument("--search", type=str, help="全文搜索历史事件")
+    parser.add_argument("--top", nargs="?", const="软件工程师向", metavar="THEME",
+                        help="回顾最近一周最符合主题的前 10 条新闻（默认主题: 软件工程师向）")
     parser.add_argument("--dry-run", action="store_true", help="试运行，不保存文件")
     parser.add_argument("--verbose", action="store_true", help="详细输出")
     return parser
@@ -283,6 +285,49 @@ def run_search(db: NewsDB, query: str) -> None:
         print()
 
 
+def run_weekly_top(db: NewsDB, config: dict[str, Any], theme: str) -> None:
+    """回顾最近一周最符合主题的前 10 条新闻。"""
+    events = db.get_recent_events(7)
+    if not events:
+        print("最近 7 天没有事件数据")
+        return
+
+    llm_config = get_llm_config(config)
+    provider = create_llm_provider(llm_config)
+    summarizer = Summarizer(provider, get_categories(config), batch_size=llm_config["batch_size"])
+
+    logger.info("正在从 %d 条事件中筛选「%s」主题 Top 10...", len(events), theme)
+    ranked_ids = summarizer.rank_by_theme(events, theme, top_n=10)
+
+    if not ranked_ids:
+        print("未能筛选出相关事件")
+        return
+
+    # 按排名顺序取出事件
+    events_map = {ev["id"]: ev for ev in events}
+    ranked_events = [events_map[eid] for eid in ranked_ids if eid in events_map]
+
+    print(f"\n## 周度回顾 | 主题: {theme} | Top {len(ranked_events)}\n")
+    for rank, ev in enumerate(ranked_events, 1):
+        tags = json.loads(ev["tags"]) if isinstance(ev["tags"], str) else ev.get("tags", [])
+        tag_str = " ".join(f"`{t}`" for t in tags) if tags else ""
+        importance_stars = "*" * ev.get("importance", 3)
+        date_str = ev.get("first_seen", "")[:10]
+        articles = db.get_articles_for_event(ev["id"])
+        source_str = ", ".join(a["source"] for a in articles[:3])
+
+        print(f"**{rank}. {ev['title_zh']}** [{importance_stars}]")
+        print(f"   {ev['summary_zh']}")
+        if source_str:
+            print(f"   来源: {source_str} | {date_str} | 报道数: {ev.get('source_count', 1)}")
+        if articles:
+            for a in articles:
+                print(f"   - {a['url']}")
+        if tag_str:
+            print(f"   标签: {tag_str}")
+        print()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -308,6 +353,11 @@ def main() -> None:
         # 搜索模式
         if args.search:
             run_search(db, args.search)
+            return
+
+        # 周度主题回顾
+        if args.top is not None:
+            run_weekly_top(db, config, args.top)
             return
 
         # 仅导出模式

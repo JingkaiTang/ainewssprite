@@ -64,6 +64,12 @@ def export_json(
 def write_json(data: dict[str, Any], path: str | Path) -> Path:
     """写入 JSON 文件。"""
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        import logging
+
+        logging.getLogger(__name__).error("写入 JSON 文件失败 %s: %s", p, e)
+        raise
     return p

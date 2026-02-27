@@ -12,6 +12,7 @@ AI 新闻精灵 -- 每日 AI 领域新闻自动聚合工具。
 - **SQLite 存储** -- 支持历史回溯、全文搜索、增量更新
 - **Markdown 日报** -- 按分类组织的每日新闻摘要，路径 `YYYY/MM/YYYYMMDD.md`
 - **JSON 导出** -- 按需导出结构化数据供其他工具消费
+- **周度主题回顾** -- 按自定义主题筛选最近一周 Top 10 新闻，附带来源链接
 - **幂等运行** -- 同一天可多次执行（cron 定时），自动去重、增量更新
 
 ## 快速开始
@@ -83,6 +84,7 @@ python -m ainewssprite [选项]
 | `--sources NAME [NAME ...]` | 仅运行指定的源，如 `hackernews techcrunch_ai` |
 | `--export json\|md\|both` | 从数据库导出指定格式 |
 | `--search QUERY` | 全文搜索历史事件 |
+| `--top [THEME]` | 回顾最近一周最符合主题的 Top 10 新闻（默认主题: `软件工程师向`） |
 | `--date YYYY-MM-DD` | 指定日期（默认今天） |
 | `--config PATH` | 指定配置文件路径（默认 `config.yaml`） |
 | `--dry-run` | 试运行，不写入文件 |
@@ -105,6 +107,12 @@ python -m ainewssprite --export md --date 2026-02-25
 
 # 试运行，输出到终端
 python -m ainewssprite --dry-run
+
+# 回顾本周最相关的 10 条新闻（默认主题: 软件工程师向）
+python -m ainewssprite --top
+
+# 自定义主题回顾
+python -m ainewssprite --top "大模型前沿研究"
 ```
 
 ## 定时运行

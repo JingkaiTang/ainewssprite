@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from ainewssprite.models import RawNewsItem
+
+logger = logging.getLogger(__name__)
+
+_WRITE_MAX_RETRIES = 3
+_WRITE_RETRY_DELAY = 0.5
 
 
 _SCHEMA = """
@@ -69,6 +77,29 @@ END;
 """
 
 
+def _retry_on_locked(func):  # type: ignore[no-untyped-def]
+    """写入操作装饰器: 遇到 database locked 时自动重试。"""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
+        last_exc: Exception | None = None
+        for attempt in range(1, _WRITE_MAX_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                last_exc = e
+                if "locked" in str(e).lower() and attempt < _WRITE_MAX_RETRIES:
+                    wait = _WRITE_RETRY_DELAY * attempt
+                    logger.warning("数据库锁定 (尝试 %d/%d), %.1f秒后重试", attempt, _WRITE_MAX_RETRIES, wait)
+                    time.sleep(wait)
+                else:
+                    logger.error("数据库操作失败 [%s]: %s", func.__name__, e)
+                    raise
+        raise last_exc  # type: ignore[misc]
+
+    return wrapper
+
+
 class NewsDB:
     """SQLite 数据库操作封装。"""
 
@@ -78,16 +109,24 @@ class NewsDB:
         self._conn: Optional[sqlite3.Connection] = None
 
     def connect(self) -> None:
-        self._conn = sqlite3.connect(str(self._db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
+        try:
+            self._conn = sqlite3.connect(str(self._db_path), timeout=10)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._init_schema()
+        except sqlite3.Error as e:
+            logger.error("数据库连接失败 %s: %s", self._db_path, e)
+            raise
 
     def close(self) -> None:
         if self._conn:
-            self._conn.close()
-            self._conn = None
+            try:
+                self._conn.close()
+            except sqlite3.Error as e:
+                logger.warning("数据库关闭异常: %s", e)
+            finally:
+                self._conn = None
 
     def __enter__(self) -> "NewsDB":
         self.connect()
@@ -103,19 +142,28 @@ class NewsDB:
         return self._conn
 
     def _init_schema(self) -> None:
-        self.conn.executescript(_SCHEMA)
-        self.conn.executescript(_FTS_SCHEMA)
-        self.conn.executescript(_FTS_TRIGGERS)
+        try:
+            self.conn.executescript(_SCHEMA)
+            self.conn.executescript(_FTS_SCHEMA)
+            self.conn.executescript(_FTS_TRIGGERS)
+        except sqlite3.Error as e:
+            logger.error("数据库 schema 初始化失败: %s", e)
+            raise
 
     def url_exists(self, url: str) -> bool:
         """检查 URL 是否已存在。"""
-        row = self.conn.execute("SELECT 1 FROM articles WHERE url = ?", (url,)).fetchone()
-        return row is not None
+        try:
+            row = self.conn.execute("SELECT 1 FROM articles WHERE url = ?", (url,)).fetchone()
+            return row is not None
+        except sqlite3.Error as e:
+            logger.warning("URL 查重失败 (%s): %s", url[:60], e)
+            return False
 
     def filter_new_items(self, items: Sequence[RawNewsItem]) -> list[RawNewsItem]:
         """过滤掉已存在的条目，返回新条目列表。"""
         return [item for item in items if not self.url_exists(item.url)]
 
+    @_retry_on_locked
     def insert_event(
         self,
         title_zh: str,
@@ -135,6 +183,7 @@ class NewsDB:
         self.conn.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
+    @_retry_on_locked
     def update_event(
         self,
         event_id: int,
@@ -162,6 +211,7 @@ class NewsDB:
             )
         self.conn.commit()
 
+    @_retry_on_locked
     def insert_article(self, item: RawNewsItem, event_id: int, now: str) -> int:
         """插入原始文章记录，返回文章 ID。"""
         cursor = self.conn.execute(
@@ -185,86 +235,110 @@ class NewsDB:
 
     def get_recent_events(self, days: int) -> list[dict[str, Any]]:
         """获取最近 N 天的事件列表。"""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        rows = self.conn.execute(
-            """SELECT id, title_zh, summary_zh, category, tags, importance,
-                      first_seen, last_updated, source_count
-               FROM events WHERE first_seen >= ? ORDER BY first_seen DESC""",
-            (cutoff,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            rows = self.conn.execute(
+                """SELECT id, title_zh, summary_zh, category, tags, importance,
+                          first_seen, last_updated, source_count
+                   FROM events WHERE first_seen >= ? ORDER BY first_seen DESC""",
+                (cutoff,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error("查询最近事件失败: %s", e)
+            return []
 
     def get_events_by_date(self, date_str: str) -> list[dict[str, Any]]:
         """获取指定日期的事件列表（按 first_seen 的日期部分匹配）。"""
-        rows = self.conn.execute(
-            """SELECT id, title_zh, summary_zh, category, tags, importance,
-                      first_seen, last_updated, source_count
-               FROM events WHERE date(first_seen) = ? OR date(last_updated) = ?
-               ORDER BY importance DESC, first_seen DESC""",
-            (date_str, date_str),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            rows = self.conn.execute(
+                """SELECT id, title_zh, summary_zh, category, tags, importance,
+                          first_seen, last_updated, source_count
+                   FROM events WHERE date(first_seen) = ? OR date(last_updated) = ?
+                   ORDER BY importance DESC, first_seen DESC""",
+                (date_str, date_str),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error("按日期查询事件失败 (%s): %s", date_str, e)
+            return []
 
     def get_events_by_ids(self, event_ids: set[int]) -> list[dict[str, Any]]:
         """获取指定 ID 的事件列表。"""
         if not event_ids:
             return []
-        placeholders = ",".join("?" for _ in event_ids)
-        rows = self.conn.execute(
-            f"""SELECT id, title_zh, summary_zh, category, tags, importance,
-                       first_seen, last_updated, source_count
-                FROM events WHERE id IN ({placeholders})
-                ORDER BY importance DESC, first_seen DESC""",
-            list(event_ids),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            placeholders = ",".join("?" for _ in event_ids)
+            rows = self.conn.execute(
+                f"""SELECT id, title_zh, summary_zh, category, tags, importance,
+                           first_seen, last_updated, source_count
+                    FROM events WHERE id IN ({placeholders})
+                    ORDER BY importance DESC, first_seen DESC""",
+                list(event_ids),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error("按 ID 查询事件失败: %s", e)
+            return []
 
     def get_articles_for_event(self, event_id: int) -> list[dict[str, Any]]:
         """获取事件关联的所有文章。"""
-        rows = self.conn.execute(
-            """SELECT id, title, url, source, author, description, published_at, fetched_at
-               FROM articles WHERE event_id = ? ORDER BY fetched_at""",
-            (event_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            rows = self.conn.execute(
+                """SELECT id, title, url, source, author, description, published_at, fetched_at
+                   FROM articles WHERE event_id = ? ORDER BY fetched_at""",
+                (event_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error("查询事件文章失败 (event_id=%d): %s", event_id, e)
+            return []
 
     def search_events(self, query: str) -> list[dict[str, Any]]:
         """全文搜索事件。"""
-        rows = self.conn.execute(
-            """SELECT e.id, e.title_zh, e.summary_zh, e.category, e.tags,
-                      e.importance, e.first_seen, e.last_updated, e.source_count
-               FROM events_fts fts
-               JOIN events e ON fts.rowid = e.id
-               WHERE events_fts MATCH ?
-               ORDER BY e.first_seen DESC""",
-            (query,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            rows = self.conn.execute(
+                """SELECT e.id, e.title_zh, e.summary_zh, e.category, e.tags,
+                          e.importance, e.first_seen, e.last_updated, e.source_count
+                   FROM events_fts fts
+                   JOIN events e ON fts.rowid = e.id
+                   WHERE events_fts MATCH ?
+                   ORDER BY e.first_seen DESC""",
+                (query,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error("全文搜索失败 (%s): %s", query, e)
+            return []
 
     def get_stats(self, date_str: str | None = None) -> dict[str, Any]:
         """获取统计信息。"""
-        if date_str:
-            event_count = self.conn.execute(
-                "SELECT COUNT(*) FROM events WHERE date(first_seen) = ? OR date(last_updated) = ?",
-                (date_str, date_str),
-            ).fetchone()[0]
-            article_count = self.conn.execute(
-                "SELECT COUNT(*) FROM articles WHERE date(fetched_at) = ?",
-                (date_str,),
-            ).fetchone()[0]
-            source_rows = self.conn.execute(
-                """SELECT source, COUNT(*) as cnt FROM articles
-                   WHERE date(fetched_at) = ? GROUP BY source""",
-                (date_str,),
-            ).fetchall()
-        else:
-            event_count = self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            article_count = self.conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-            source_rows = self.conn.execute(
-                "SELECT source, COUNT(*) as cnt FROM articles GROUP BY source"
-            ).fetchall()
-        return {
-            "event_count": event_count,
-            "article_count": article_count,
-            "sources": {r["source"]: r["cnt"] for r in source_rows},
-        }
+        try:
+            if date_str:
+                event_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE date(first_seen) = ? OR date(last_updated) = ?",
+                    (date_str, date_str),
+                ).fetchone()[0]
+                article_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM articles WHERE date(fetched_at) = ?",
+                    (date_str,),
+                ).fetchone()[0]
+                source_rows = self.conn.execute(
+                    """SELECT source, COUNT(*) as cnt FROM articles
+                       WHERE date(fetched_at) = ? GROUP BY source""",
+                    (date_str,),
+                ).fetchall()
+            else:
+                event_count = self.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                article_count = self.conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+                source_rows = self.conn.execute(
+                    "SELECT source, COUNT(*) as cnt FROM articles GROUP BY source"
+                ).fetchall()
+            return {
+                "event_count": event_count,
+                "article_count": article_count,
+                "sources": {r["source"]: r["cnt"] for r in source_rows},
+            }
+        except sqlite3.Error as e:
+            logger.error("获取统计信息失败: %s", e)
+            return {"event_count": 0, "article_count": 0, "sources": {}}

@@ -102,6 +102,12 @@ def write_daily_markdown(
     filename = dt.strftime("%Y%m%d") + ".md"
 
     path = Path(output_dir) / year / month / filename
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except OSError as e:
+        import logging
+
+        logging.getLogger(__name__).error("写入 Markdown 日报失败 %s: %s", path, e)
+        raise
     return path

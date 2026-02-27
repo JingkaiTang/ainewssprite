@@ -8,6 +8,7 @@ from typing import Any, Sequence
 
 from ainewssprite.llm.base import LLMProvider
 from ainewssprite.models import RawNewsItem
+from ainewssprite.utils.text import is_chinese
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ SYSTEM_PROMPT = "你是一个专业的 AI 领域新闻编辑，负责对 AI 相�
 
 
 def build_batch_prompt(items: Sequence[RawNewsItem], categories: dict[str, Any]) -> str:
-    """构建批量摘要 Prompt。"""
+    """构建批量摘要 Prompt（用于非中文条目，需要翻译）。"""
     cat_list = ", ".join(categories.keys())
 
     news_lines = []
@@ -41,6 +42,36 @@ def build_batch_prompt(items: Sequence[RawNewsItem], categories: dict[str, Any])
     "index": 1,
     "title_zh": "中文标题",
     "summary_zh": "中文摘要",
+    "category": "分类",
+    "tags": ["标签1", "标签2"],
+    "importance": 3
+  }}
+]"""
+
+
+def build_classify_prompt(items: Sequence[RawNewsItem], categories: dict[str, Any]) -> str:
+    """构建分类 Prompt（用于已经是中文的条目，无需翻译）。"""
+    cat_list = ", ".join(categories.keys())
+
+    news_lines = []
+    for i, item in enumerate(items, 1):
+        news_lines.append(f"{i}. 标题: {item.title}\n   描述: {item.description[:200]}")
+
+    news_text = "\n\n".join(news_lines)
+
+    return f"""以下 {len(items)} 条新闻已经是中文，请仅做分类和评估（不需要翻译）:
+
+{news_text}
+
+对每条新闻:
+1. 分类到以下类别之一: {cat_list}
+2. 提取 1-3 个关键词标签
+3. 评估重要性 (1-5, 5为最重要)
+
+严格按以下 JSON 数组格式输出，不要输出其他内容:
+[
+  {{
+    "index": 1,
     "category": "分类",
     "tags": ["标签1", "标签2"],
     "importance": 3
@@ -75,10 +106,11 @@ def parse_batch_response(
     for r in results:
         idx = r.get("index", 0) - 1
         if 0 <= idx < len(items):
+            item = items[idx]
             parsed.append({
-                "raw": items[idx],
-                "title_zh": r.get("title_zh", ""),
-                "summary_zh": r.get("summary_zh", ""),
+                "raw": item,
+                "title_zh": r.get("title_zh", item.title),
+                "summary_zh": r.get("summary_zh", item.description[:80] or item.title),
                 "category": r.get("category", "events"),
                 "tags": r.get("tags", []),
                 "importance": r.get("importance", 3),
@@ -100,23 +132,50 @@ class Summarizer:
         self._batch_size = batch_size
 
     def summarize(self, items: Sequence[RawNewsItem]) -> list[dict[str, Any]]:
-        """批量处理新闻条目，返回处理结果列表。"""
+        """批量处理新闻条目。中文条目只做分类，非中文条目做翻译+摘要。"""
+        # 按语言分组
+        zh_items: list[RawNewsItem] = []
+        other_items: list[RawNewsItem] = []
+        for item in items:
+            if is_chinese(item.title):
+                zh_items.append(item)
+            else:
+                other_items.append(item)
+
+        logger.info("条目分布: %d 条中文, %d 条非中文", len(zh_items), len(other_items))
+
         all_results: list[dict[str, Any]] = []
+
+        # 中文条目: 仅分类+打标签
+        all_results.extend(self._process_chinese(zh_items))
+
+        # 非中文条目: 翻译+摘要+分类
+        all_results.extend(self._process_translate(other_items))
+
+        return all_results
+
+    def _process_chinese(self, items: Sequence[RawNewsItem]) -> list[dict[str, Any]]:
+        """处理中文条目: 用原标题/描述，只调 LLM 做分类。"""
+        results: list[dict[str, Any]] = []
 
         for i in range(0, len(items), self._batch_size):
             batch = items[i : i + self._batch_size]
-            logger.info("处理批次 %d-%d / %d", i + 1, i + len(batch), len(items))
+            logger.info("分类中文批次 %d-%d / %d", i + 1, i + len(batch), len(items))
 
-            prompt = build_batch_prompt(batch, self._categories)
+            prompt = build_classify_prompt(batch, self._categories)
             try:
                 response = self._provider.chat(prompt, system=SYSTEM_PROMPT)
-                results = parse_batch_response(response, batch)
-                all_results.extend(results)
+                parsed = parse_batch_response(response, batch)
+                # 用原始标题和描述覆盖（LLM 只返回了分类）
+                for p in parsed:
+                    raw: RawNewsItem = p["raw"]
+                    p["title_zh"] = raw.title
+                    p["summary_zh"] = raw.description[:80] or raw.title
+                results.extend(parsed)
             except Exception as e:
-                logger.error("LLM 批量摘要失败: %s", e)
-                # 对失败的批次生成占位结果
+                logger.error("中文分类失败: %s", e)
                 for item in batch:
-                    all_results.append({
+                    results.append({
                         "raw": item,
                         "title_zh": item.title,
                         "summary_zh": item.description[:80] or item.title,
@@ -125,7 +184,33 @@ class Summarizer:
                         "importance": 3,
                     })
 
-        return all_results
+        return results
+
+    def _process_translate(self, items: Sequence[RawNewsItem]) -> list[dict[str, Any]]:
+        """处理非中文条目: 翻译+摘要+分类。"""
+        results: list[dict[str, Any]] = []
+
+        for i in range(0, len(items), self._batch_size):
+            batch = items[i : i + self._batch_size]
+            logger.info("翻译摘要批次 %d-%d / %d", i + 1, i + len(batch), len(items))
+
+            prompt = build_batch_prompt(batch, self._categories)
+            try:
+                response = self._provider.chat(prompt, system=SYSTEM_PROMPT)
+                results.extend(parse_batch_response(response, batch))
+            except Exception as e:
+                logger.error("LLM 批量摘要失败: %s", e)
+                for item in batch:
+                    results.append({
+                        "raw": item,
+                        "title_zh": item.title,
+                        "summary_zh": item.description[:80] or item.title,
+                        "category": "events",
+                        "tags": [],
+                        "importance": 3,
+                    })
+
+        return results
 
     def generate_daily_overview(self, events: list[dict[str, Any]]) -> str:
         """根据当天所有事件生成日报总结（重点看点 + 趋势）。"""
@@ -165,3 +250,62 @@ class Summarizer:
         except Exception as e:
             logger.warning("生成日报总结失败: %s", e)
             return ""
+
+    def rank_by_theme(
+        self,
+        events: list[dict[str, Any]],
+        theme: str,
+        top_n: int = 10,
+    ) -> list[int]:
+        """根据主题对事件排序，返回最相关的 top_n 个事件 ID（按相关度降序）。"""
+        if not events:
+            return []
+
+        event_lines = []
+        for ev in events:
+            tags_str = ev.get("tags", "[]")
+            if isinstance(tags_str, str):
+                try:
+                    tags = json.loads(tags_str)
+                except json.JSONDecodeError:
+                    tags = []
+            else:
+                tags = tags_str
+            event_lines.append(
+                f"ID={ev['id']} | 分类={ev.get('category', '')} | "
+                f"标签={','.join(tags)} | 来源数={ev.get('source_count', 1)} | "
+                f"标题: {ev['title_zh']}\n  摘要: {ev['summary_zh']}"
+            )
+
+        events_text = "\n".join(event_lines)
+
+        prompt = f"""以下是最近一周的 AI 领域新闻事件列表:
+
+{events_text}
+
+请从中筛选出最符合「{theme}」主题的前 {top_n} 条新闻，按相关度从高到低排序。
+
+评判标准:
+1. 与「{theme}」主题的相关度（最重要）
+2. 新闻本身的重要性和影响力
+3. 多源报道的事件优先
+
+严格按以下 JSON 数组格式输出，不要输出其他内容:
+[{{"id": 事件ID}}, {{"id": 事件ID}}, ...]
+
+只输出 ID 列表，最多 {top_n} 条。"""
+
+        try:
+            response = self._provider.chat(prompt, system=SYSTEM_PROMPT)
+            text = response.strip()
+            start = text.find("[")
+            end = text.rfind("]") + 1
+            if start >= 0 and end > start:
+                text = text[start:end]
+            result = json.loads(text)
+            return [item["id"] for item in result if "id" in item][:top_n]
+        except Exception as e:
+            logger.error("主题排序失败: %s", e)
+            # 降级: 按 importance 排序返回
+            sorted_events = sorted(events, key=lambda e: e.get("importance", 0), reverse=True)
+            return [e["id"] for e in sorted_events[:top_n]]

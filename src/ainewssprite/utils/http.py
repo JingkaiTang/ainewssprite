@@ -44,7 +44,19 @@ class PoliteClient:
                 resp.raise_for_status()
                 self._last_request[domain] = time.monotonic()
                 return resp
-            except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                # 4xx 客户端错误不重试（404/403 等不会因重试而改变）
+                if 400 <= e.response.status_code < 500:
+                    logger.error("请求失败 %s: %s", url, e)
+                    raise
+                if attempt < self._max_retries:
+                    wait = 2 ** (attempt - 1)
+                    logger.warning("请求失败 %s (尝试 %d/%d), %s秒后重试: %s", url, attempt, self._max_retries, wait, e)
+                    time.sleep(wait)
+                else:
+                    logger.error("请求最终失败 %s: %s", url, e)
+            except httpx.TransportError as e:
                 last_exc = e
                 if attempt < self._max_retries:
                     wait = 2 ** (attempt - 1)
