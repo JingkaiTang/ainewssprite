@@ -17,3 +17,4 @@ data/cache/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+cp2obsidian.sh

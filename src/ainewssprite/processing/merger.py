@@ -72,9 +72,21 @@ def parse_match_response(response_text: str) -> dict[str, Any]:
 
     try:
         result = json.loads(text)
+        raw_event_id = result.get("event_id")
+        event_id: int | None = None
+        if isinstance(raw_event_id, int) and not isinstance(raw_event_id, bool):
+            event_id = raw_event_id
+        elif isinstance(raw_event_id, str):
+            raw_event_id = raw_event_id.strip()
+            if raw_event_id:
+                try:
+                    event_id = int(raw_event_id)
+                except ValueError:
+                    event_id = None
+
         return {
             "match": bool(result.get("match", False)),
-            "event_id": result.get("event_id"),
+            "event_id": event_id,
         }
     except (json.JSONDecodeError, KeyError):
         logger.warning("无法解析 LLM 匹配响应: %s", text[:200])
