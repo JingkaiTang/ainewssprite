@@ -79,43 +79,153 @@ def build_classify_prompt(items: Sequence[RawNewsItem], categories: dict[str, An
 ]"""
 
 
+def _fix_json(text: str) -> str:
+    """尝试修复常见的 JSON 格式问题。"""
+    import re
+    # 去掉 markdown 代码块标记
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    # 去掉行尾多余逗号 (], 前 / }, 前)
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # 修复未转义的换行符（JSON 字符串内部）
+    text = re.sub(r'(?<=": ")(.*?)(?=")', lambda m: m.group(0).replace("\n", "\\n"), text)
+    return text
+
+
+def _try_parse_json(text: str) -> Any:
+    """多策略 JSON 解析：原文 → 提取数组 → 修复后重试 → 提取对象 → 逐行提取。"""
+    # 1) 直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) 提取最外层 [] (优先，因为批量响应通常是数组)
+    start = text.find("[")
+    end = text.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 3) 修复常见格式问题（尾逗号、markdown 代码块等）后重试数组
+    fixed = _fix_json(text)
+    start = fixed.find("[")
+    end = fixed.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(fixed[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 4) 提取 {} 对象 (原文和修复后都试)
+    for src in [text, fixed]:
+        start = src.find("{")
+        end = src.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(src[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+
+    # 5) 逐行提取独立的 JSON 对象
+    import re
+    objects = []
+    for m in re.finditer(r"\{[^{}]*\}", text):
+        try:
+            objects.append(json.loads(m.group()))
+        except json.JSONDecodeError:
+            continue
+    if objects:
+        return objects
+
+    return None
+
+
 def parse_batch_response(
     response_text: str,
     items: Sequence[RawNewsItem],
 ) -> list[dict[str, Any]]:
-    """解析 LLM 批量摘要响应。"""
+    """解析 LLM 批量摘要响应，多策略容错。"""
     text = response_text.strip()
 
-    # 提取 JSON 数组
-    start = text.find("[")
-    end = text.rfind("]") + 1
-    if start >= 0 and end > start:
-        text = text[start:end]
+    result = _try_parse_json(text)
 
-    try:
-        results = json.loads(text)
-    except json.JSONDecodeError:
+    if result is None:
         logger.error("无法解析 LLM 批量响应: %s", text[:300])
         return []
 
-    if not isinstance(results, list):
-        logger.error("LLM 响应不是数组: %s", type(results))
+    # 如果返回的是单个 dict，包装成列表
+    if isinstance(result, dict):
+        result = [result]
+
+    if not isinstance(result, list):
+        logger.error("LLM 响应不是数组: %s", type(result))
         return []
 
     parsed: list[dict[str, Any]] = []
-    for r in results:
-        idx = r.get("index", 0) - 1
+    for r in result:
+        if not isinstance(r, dict):
+            continue
+        idx = _safe_int(r.get("index"), 0) - 1
         if 0 <= idx < len(items):
             item = items[idx]
+            tags = r.get("tags", [])
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            elif not isinstance(tags, list):
+                tags = []
             parsed.append({
                 "raw": item,
-                "title_zh": r.get("title_zh", item.title),
-                "summary_zh": r.get("summary_zh", item.description[:80] or item.title),
-                "category": r.get("category", "events"),
-                "tags": r.get("tags", []),
-                "importance": r.get("importance", 3),
+                "title_zh": str(r.get("title_zh", "") or item.title),
+                "summary_zh": str(r.get("summary_zh", "") or item.description[:80] or item.title),
+                "category": str(r.get("category", "") or "events"),
+                "tags": tags,
+                "importance": _safe_int(r.get("importance"), 3),
             })
+
+    # 对于未解析到的条目，用 index 位置猜测匹配
+    parsed_indices = {_safe_int(r.get("index"), 0) - 1 for r in result if isinstance(r, dict)}
+    if len(parsed) < len(result):
+        for seq, r in enumerate(result):
+            if not isinstance(r, dict):
+                continue
+            idx = _safe_int(r.get("index"), 0) - 1
+            if idx < 0 or idx >= len(items):
+                # index 缺失或越界，尝试用序号作为 index
+                if 0 <= seq < len(items) and seq not in parsed_indices:
+                    item = items[seq]
+                    tags = r.get("tags", [])
+                    if isinstance(tags, str):
+                        tags = [t.strip() for t in tags.split(",") if t.strip()]
+                    elif not isinstance(tags, list):
+                        tags = []
+                    parsed.append({
+                        "raw": item,
+                        "title_zh": str(r.get("title_zh", "") or item.title),
+                        "summary_zh": str(r.get("summary_zh", "") or item.description[:80] or item.title),
+                        "category": str(r.get("category", "") or "events"),
+                        "tags": tags,
+                        "importance": _safe_int(r.get("importance"), 3),
+                    })
+                    parsed_indices.add(seq)
+                    logger.warning("条目 index=%s 越界，按序号 %d 匹配", r.get("index"), seq + 1)
+
     return parsed
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    """安全地将值转为 int。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
+    return default
 
 
 class Summarizer:
@@ -297,13 +407,22 @@ class Summarizer:
 
         try:
             response = self._provider.chat(prompt, system=SYSTEM_PROMPT)
-            text = response.strip()
-            start = text.find("[")
-            end = text.rfind("]") + 1
-            if start >= 0 and end > start:
-                text = text[start:end]
-            result = json.loads(text)
-            return [item["id"] for item in result if "id" in item][:top_n]
+            result = _try_parse_json(response.strip())
+            if result is None:
+                raise ValueError(f"无法解析响应: {response[:200]}")
+            if isinstance(result, dict) and "id" in result:
+                result = [result]
+            if not isinstance(result, list):
+                raise ValueError(f"响应不是数组: {type(result)}")
+            ids = []
+            for item in result:
+                if isinstance(item, dict):
+                    eid = _safe_int(item.get("id"), -1)
+                    if eid > 0:
+                        ids.append(eid)
+                elif isinstance(item, (int, float)):
+                    ids.append(int(item))
+            return ids[:top_n]
         except Exception as e:
             logger.error("主题排序失败: %s", e)
             # 降级: 按 importance 排序返回
